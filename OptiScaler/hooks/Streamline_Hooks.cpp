@@ -312,20 +312,95 @@ sl::Result StreamlineHooks::hkslInit(const sl::Preferences& pref, uint64_t sdkVe
     return o_slInit(localPref, sdkVersion);
 }
 
+// FGInput = nvngxfg with an NGX frame-generation provider (HelixSR, Nukem's, ...): the game's own sl.dlss_g is loaded
+// and presents, the provider generates the frames. On a GPU without real DLSS-G the game still asks Streamline whether
+// DLSS-G is supported before it offers its frame-generation toggle, and Streamline's own answers can say no (real
+// architecture, driver version, HAGS, V-Sync). These hooks log what the game asks and make the answers agree with the
+// provider being there.
+static bool IsNvngxFGProvided()
+{
+    const auto& state = State::Instance();
+    return state.activeFgInput == FGInput::NvngxFG && state.activeFgNvngx != FGNvngxReplacement::None;
+}
+
+static bool VersionBelow(const sl::Version& a, const sl::Version& b)
+{
+    if (a.major != b.major)
+        return a.major < b.major;
+    if (a.minor != b.minor)
+        return a.minor < b.minor;
+    return a.build < b.build;
+}
+
+static void LogDlssgRequirements(const char* when, sl::Result result, const sl::FeatureRequirements& r)
+{
+    LOG_INFO("DLSS-G requirements ({}): result {}, flags 0x{:X} (D3D12 {}, V-Sync off required {}, HAGS required {}), "
+             "OS {} / required {}, driver {} / required {}",
+             when, magic_enum::enum_name(result), (uint32_t) r.flags,
+             ((uint32_t) r.flags & (uint32_t) sl::FeatureRequirementFlags::eD3D12Supported) != 0,
+             ((uint32_t) r.flags & (uint32_t) sl::FeatureRequirementFlags::eVSyncOffRequired) != 0,
+             ((uint32_t) r.flags & (uint32_t) sl::FeatureRequirementFlags::eHardwareSchedulingRequired) != 0,
+             r.osVersionDetected.toStr(), r.osVersionRequired.toStr(), r.driverVersionDetected.toStr(),
+             r.driverVersionRequired.toStr());
+}
+
+// What DLSS-G needs from the system, as it is with an NGX frame-generation provider on any GPU
+static void FixDlssgRequirements(sl::FeatureRequirements& r)
+{
+    uint32_t flags = (uint32_t) r.flags;
+    flags |= (uint32_t) sl::FeatureRequirementFlags::eD3D12Supported;
+    flags &= ~((uint32_t) sl::FeatureRequirementFlags::eVSyncOffRequired |
+               (uint32_t) sl::FeatureRequirementFlags::eHardwareSchedulingRequired);
+    r.flags = (sl::FeatureRequirementFlags) flags;
+
+    // No NVIDIA driver: the detected version is 0 or the fake one, never below what DLSS-G asks for
+    if (r.driverVersionRequired && VersionBelow(r.driverVersionDetected, r.driverVersionRequired))
+        r.driverVersionDetected = r.driverVersionRequired;
+
+    if (r.osVersionRequired && VersionBelow(r.osVersionDetected, r.osVersionRequired))
+        r.osVersionDetected = r.osVersionRequired;
+}
+
 sl::Result StreamlineHooks::hkslIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapterInfo)
 {
     if (feature == sl::kFeatureDLSS_G)
-        return sl::Result::eOk;
+    {
+        if (!IsNvngxFGProvided())
+            return sl::Result::eOk;
 
-    return o_slIsFeatureSupported(feature, adapterInfo);
+        auto result = o_slIsFeatureSupported(feature, adapterInfo);
+        LOG_INFO("Game asked slIsFeatureSupported(DLSS-G): Streamline says {}", magic_enum::enum_name(result));
+
+        if (result != sl::Result::eOk)
+        {
+            LOG_INFO("DLSS-G reported as supported: the NGX frame-generation provider generates the frames");
+            return sl::Result::eOk;
+        }
+
+        return result;
+    }
+
+    auto result = o_slIsFeatureSupported(feature, adapterInfo);
+
+    if (IsNvngxFGProvided())
+        LOG_DEBUG("Game asked slIsFeatureSupported({}): {}", (uint32_t) feature, magic_enum::enum_name(result));
+
+    return result;
 }
 
 sl::Result StreamlineHooks::hkslIsFeatureLoaded(sl::Feature feature, bool& loaded)
 {
     if (feature == sl::kFeatureDLSS_G)
     {
-        loaded = true;
-        return sl::Result::eOk;
+        if (!IsNvngxFGProvided())
+        {
+            loaded = true;
+            return sl::Result::eOk;
+        }
+
+        auto result = o_slIsFeatureLoaded(feature, loaded);
+        LOG_INFO("Game asked slIsFeatureLoaded(DLSS-G): {}, loaded {}", magic_enum::enum_name(result), loaded);
+        return result;
     }
 
     return o_slIsFeatureLoaded(feature, loaded);
@@ -334,7 +409,22 @@ sl::Result StreamlineHooks::hkslIsFeatureLoaded(sl::Feature feature, bool& loade
 sl::Result StreamlineHooks::hkslGetFeatureRequirements(sl::Feature feature, sl::FeatureRequirements& requirements)
 {
     if (feature == sl::kFeatureDLSS_G)
+    {
+        if (!IsNvngxFGProvided())
+        {
+            // OptiScaler's own DLSS-G answers (dlssg input): no plugin to ask, D3D12 is what there is
+            FixDlssgRequirements(requirements);
+            return sl::Result::eOk;
+        }
+
+        auto result = o_slGetFeatureRequirements(feature, requirements);
+        LogDlssgRequirements("from Streamline", result, requirements);
+
+        FixDlssgRequirements(requirements);
+        LogDlssgRequirements("given to the game", sl::Result::eOk, requirements);
+
         return sl::Result::eOk;
+    }
 
     return o_slGetFeatureRequirements(feature, requirements);
 }
@@ -343,6 +433,14 @@ sl::Result StreamlineHooks::hkslGetFeatureVersion(sl::Feature feature, sl::Featu
 {
     if (feature == sl::kFeatureDLSS_G)
     {
+        if (IsNvngxFGProvided())
+        {
+            auto result = o_slGetFeatureVersion(feature, version);
+            LOG_INFO("Game asked slGetFeatureVersion(DLSS-G): {}, SL {}, NGX {}", magic_enum::enum_name(result),
+                     version.versionSL.toStr(), version.versionNGX.toStr());
+            return result;
+        }
+
         version.versionSL = { State::Instance().streamlineVersion.major, State::Instance().streamlineVersion.minor,
                               State::Instance().streamlineVersion.patch };
         version.versionNGX = { 4, 2, 0 };
@@ -431,6 +529,15 @@ static sl::Result dummy_slDLSSGSetOptions(const sl::ViewportHandle& viewport, co
 
 sl::Result StreamlineHooks::hkslGetFeatureFunction(sl::Feature feature, const char* functionName, void*& function)
 {
+    // The game's sl.dlss_g is loaded and serves its own functions, only logged
+    if (feature == sl::kFeatureDLSS_G && IsNvngxFGProvided())
+    {
+        auto result = o_slGetFeatureFunction(feature, functionName, function);
+        LOG_INFO("Game asked slGetFeatureFunction(DLSS-G, {}): {}", functionName ? functionName : "null",
+                 magic_enum::enum_name(result));
+        return result;
+    }
+
     if (feature == sl::kFeatureDLSS_G)
     {
         if (strcmp(functionName, "slDLSSGSetOptions") == 0)
@@ -2140,6 +2247,25 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
 
                     if (o_slFreeResources != nullptr)
                         DetourAttach(&(PVOID&) o_slFreeResources, hkslFreeResources);
+                }
+                else if (State::Instance().activeFgInput == FGInput::NvngxFG)
+                {
+                    // The game's DLSS-G stays loaded: only its support queries are answered for the NGX provider
+                    // (and logged), its functions and resources are Streamline's own
+                    if (o_slIsFeatureSupported != nullptr)
+                        DetourAttach(&(PVOID&) o_slIsFeatureSupported, hkslIsFeatureSupported);
+
+                    if (o_slIsFeatureLoaded != nullptr)
+                        DetourAttach(&(PVOID&) o_slIsFeatureLoaded, hkslIsFeatureLoaded);
+
+                    if (o_slGetFeatureRequirements != nullptr)
+                        DetourAttach(&(PVOID&) o_slGetFeatureRequirements, hkslGetFeatureRequirements);
+
+                    if (o_slGetFeatureVersion != nullptr)
+                        DetourAttach(&(PVOID&) o_slGetFeatureVersion, hkslGetFeatureVersion);
+
+                    if (o_slGetFeatureFunction != nullptr)
+                        DetourAttach(&(PVOID&) o_slGetFeatureFunction, hkslGetFeatureFunction);
                 }
 
                 // if (o_slGetNativeInterface != nullptr)
